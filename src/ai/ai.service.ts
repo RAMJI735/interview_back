@@ -121,12 +121,16 @@ export class AiService {
   ): Promise<string> {
     const genAI = new GoogleGenerativeAI(this.apiKeys.gemini);
     const model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash-lite-001',
+      model: 'gemini-2.5-flash',
     });
 
     const parts: Part[] = [{ text: `${systemPrompt}\n\n${userPrompt}` }];
 
     if (screenshotBase64) {
+      // Detect mime type dynamically
+      const mimeMatch = screenshotBase64.match(/^data:(image\/\w+);base64,/);
+      const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+
       // Remove data URL prefix if present
       const base64Data = screenshotBase64.replace(
         /^data:image\/\w+;base64,/,
@@ -134,7 +138,7 @@ export class AiService {
       );
       parts.push({
         inlineData: {
-          mimeType: 'image/png',
+          mimeType: mimeType,
           data: base64Data,
         },
       });
@@ -143,7 +147,15 @@ export class AiService {
         '\n\nHere is a screenshot of the screen for additional context:';
     }
 
-    const result = await model.generateContent(parts);
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        // @ts-ignore
+        thinkingConfig: {
+          thinkingBudget: 0,
+        },
+      },
+    });
     const response = result.response;
     return response.text();
   }

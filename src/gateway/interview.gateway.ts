@@ -121,6 +121,49 @@ export class InterviewGateway
     }
   }
 
+  @SubscribeMessage('analyze-screenshot')
+  async handleAnalyzeScreenshot(
+    @MessageBody() data: { image: string; question?: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const start = Date.now();
+    const session = this.clientSessions.get(client.id);
+    const model = session?.model || 'gemini-flash';
+
+    if (session) {
+      session.lastScreenshot = data.image;
+    }
+
+    client.emit('processing-start', { type: 'screenshot' });
+    this.logger.log(`[analyze-screenshot] Starting analysis with model ${model}, image size: ${Math.round(data.image.length / 1024)} KB`);
+
+    try {
+      const apiStart = Date.now();
+      const response = await this.aiService.generateResponse({
+        transcript:
+          data.question ||
+          'What is shown on this screen? Describe the code or content.',
+        screenshotBase64: data.image,
+        resumeContext: this.ragService.getContext(),
+        model,
+      });
+      this.logger.log(`[analyze-screenshot] generateResponse took ${Date.now() - apiStart}ms (latency reported: ${response.latency}ms)`);
+
+      client.emit('ai-response', {
+        text: response.text,
+        done: true,
+      });
+      this.logger.log(`[analyze-screenshot] Completed full flow in ${Date.now() - start}ms`);
+    } catch (error: any) {
+      this.logger.error(`Failed to analyze screenshot after ${Date.now() - start}ms: ${error.message || error}`);
+      client.emit('error', { message: error.message || 'Failed to analyze screenshot' });
+      client.emit('ai-response', {
+        text: '',
+        done: true,
+      });
+    }
+  }
+
   @SubscribeMessage('text-query')
   async handleTextQuery(
     @MessageBody() data: { text: string; model?: string },

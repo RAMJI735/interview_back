@@ -23,19 +23,34 @@ async function listModels() {
     // In SDK, it might not be directly exposed easily on the main class in older versions, 
     // but let's try to just run a simple generateContent with 'gemini-pro' to see if baseline works.
     
-    // Changing strategy: test multiple known model names.
-    const modelsToTest = ['gemini-1.5-flash', 'gemini-1.5-flash-001', 'gemini-1.5-pro', 'gemini-pro', 'gemini-1.0-pro'];
-    
-    for (const modelName of modelsToTest) {
-        console.log(`Testing model: ${modelName}`);
-        try {
-            const m = genAI.getGenerativeModel({ model: modelName });
-            const result = await m.generateContent('Hello');
-            console.log(`✅ Success: ${modelName}`);
-            // console.log(result.response.text());
-        } catch (e: any) {
-            console.log(`❌ Failed: ${modelName} - ${e.message.split(']')[1] || e.message}`);
-        }
+    // Test 1: Standard gemini-2.5-flash
+    console.log('Testing gemini-2.5-flash (Standard)...');
+    const start1 = Date.now();
+    try {
+        const m = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        const result = await m.generateContent('Hello');
+        console.log(`✅ Success: Standard took ${Date.now() - start1}ms`);
+    } catch (e: any) {
+        console.log(`❌ Failed Standard: ${e.message}`);
+    }
+
+    // Test 2: gemini-2.5-flash with thinkingBudget = 0
+    console.log('Testing gemini-2.5-flash (No Thinking)...');
+    const start2 = Date.now();
+    try {
+        const m = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        const result = await m.generateContent({
+            contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+            generationConfig: {
+                // @ts-ignore
+                thinkingConfig: {
+                    thinkingBudget: 0,
+                },
+            },
+        });
+        console.log(`✅ Success: No Thinking took ${Date.now() - start2}ms`);
+    } catch (e: any) {
+        console.log(`❌ Failed No Thinking: ${e.message}`);
     }
 
   } catch (error) {
