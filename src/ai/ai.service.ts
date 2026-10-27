@@ -30,6 +30,8 @@ export class AiService {
       gemini: this.configService.get<string>('GEMINI_API_KEY') || '',
       openai: this.configService.get<string>('OPENAI_API_KEY') || '',
       anthropic: this.configService.get<string>('ANTHROPIC_API_KEY') || '',
+      openrouter: this.configService.get<string>('OPENROUTER_API_KEY') || '',
+      groq: this.configService.get<string>('GROQ_API_KEY') || '',
     };
   }
 
@@ -64,12 +66,32 @@ export class AiService {
         case 'claude-sonnet':
           text = await this.callClaude(systemPrompt, userPrompt);
           break;
-        default:
-          text = await this.callGemini(
+        case 'nemotron':
+        case 'openrouter-nemotron':
+          text = await this.callOpenRouter(
             systemPrompt,
             userPrompt,
             request.screenshotBase64,
           );
+          break;
+        case 'groq-llama':
+          text = await this.callGroq(systemPrompt, userPrompt);
+          break;
+        default:
+          if (this.apiKeys.openrouter) {
+            this.logger.log(`Model "${request.model}" routing to OpenRouter Nemotron`);
+            text = await this.callOpenRouter(
+              systemPrompt,
+              userPrompt,
+              request.screenshotBase64,
+            );
+          } else {
+            text = await this.callGemini(
+              systemPrompt,
+              userPrompt,
+              request.screenshotBase64,
+            );
+          }
       }
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -113,51 +135,183 @@ export class AiService {
     );
   }
 
-  // ── Gemini (with Vision support) ──
+  // ── OpenRouter (NVIDIA Nemotron with Vision & Fallbacks) ──
+  private async callOpenRouter(
+    systemPrompt: string,
+    userPrompt: string,
+    screenshotBase64?: string,
+    preferredModel?: string,
+  ): Promise<string> {
+    const apiKey = this.apiKeys.openrouter;
+    if (!apiKey) {
+      throw new Error(
+        'OpenRouter API key is not configured. Please enter your OpenRouter key in Settings.',
+      );
+    }
+
+    const openai = new OpenAI({
+      apiKey,
+      baseURL: 'https://openrouter.ai/api/v1',
+      defaultHeaders: {
+        'HTTP-Referer': 'https://github.com/RAMJI735/Interview_ai',
+        'X-Title': 'Interview AI',
+      },
+    });
+
+    const messages: OpenAI.ChatCompletionMessageParam[] = [
+      { role: 'system', content: systemPrompt },
+    ];
+
+    if (screenshotBase64) {
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: userPrompt + '\n\nHere is a screenshot of the screen for context:',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: screenshotBase64, detail: 'low' },
+          },
+        ],
+      });
+    } else {
+      messages.push({ role: 'user', content: userPrompt });
+    }
+
+    // Try Nemotron models on OpenRouter (free tier priority)
+    const modelCandidates = [
+      ...(preferredModel ? [preferredModel] : []),
+      'google/gemini-2.0-flash-exp:free',
+      'nvidia/llama-3.1-nemotron-70b-instruct:free',
+      'nvidia/nemotron-3.5-super-vl:free',
+      'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'meta-llama/llama-3.3-70b-instruct:free',
+    ];
+
+    let lastErr: Error | null = null;
+    for (const model of modelCandidates) {
+      try {
+        this.logger.log(`Attempting OpenRouter generation with model: ${model}`);
+        const completion = await openai.chat.completions.create({
+          model,
+          messages,
+          max_tokens: 1024,
+          temperature: 0.7,
+        });
+
+        const content = completion.choices[0]?.message?.content;
+        if (content) {
+          return content;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.warn(`OpenRouter model ${model} failed: ${msg}`);
+        lastErr = err instanceof Error ? err : new Error(msg);
+      }
+    }
+
+    throw lastErr || new Error('All OpenRouter model candidates failed');
+  }
+
+  // ── Groq (Llama 3.3 70B Fast) ──
+  private async callGroq(
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    const apiKey = this.apiKeys.groq;
+    if (!apiKey) {
+      this.logger.warn('Groq API key not configured, falling back to Gemini Flash');
+      return this.callGemini(systemPrompt, userPrompt);
+    }
+
+    const groqClient = new OpenAI({
+      apiKey,
+      baseURL: 'https://api.groq.com/openai/v1',
+    });
+
+    const completion = await groqClient.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 1024,
+      temperature: 0.7,
+    });
+
+    return completion.choices[0]?.message?.content || 'No response generated.';
+  }
+
+  // ── Gemini (with Vision support & OpenRouter fallback) ──
   private async callGemini(
     systemPrompt: string,
     userPrompt: string,
     screenshotBase64?: string,
   ): Promise<string> {
-    const genAI = new GoogleGenerativeAI(this.apiKeys.gemini);
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-    });
+    const envKey = (this.configService.get<string>('GEMINI_API_KEY') || process.env.GEMINI_API_KEY || '').trim();
+    let apiKey = (this.apiKeys.gemini || '').trim();
 
-    const parts: Part[] = [{ text: `${systemPrompt}\n\n${userPrompt}` }];
-
-    if (screenshotBase64) {
-      // Detect mime type dynamically
-      const mimeMatch = screenshotBase64.match(/^data:(image\/\w+);base64,/);
-      const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
-
-      // Remove data URL prefix if present
-      const base64Data = screenshotBase64.replace(
-        /^data:image\/\w+;base64,/,
-        '',
-      );
-      parts.push({
-        inlineData: {
-          mimeType: mimeType,
-          data: base64Data,
-        },
-      });
-      const firstPart = parts[0] as { text: string };
-      firstPart.text +=
-        '\n\nHere is a screenshot of the screen for additional context:';
+    // If apiKey is empty or mistakenly set to OpenRouter key, use the working envKey
+    if (!apiKey || apiKey.startsWith('sk-or-')) {
+      apiKey = envKey;
     }
 
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        // @ts-ignore
-        thinkingConfig: {
-          thinkingBudget: 0,
+    // Function to run Gemini with a given key
+    const runGoogleApi = async (keyToUse: string): Promise<string> => {
+      const genAI = new GoogleGenerativeAI(keyToUse);
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const parts: Part[] = [{ text: `${systemPrompt}\n\n${userPrompt}` }];
+
+      if (screenshotBase64) {
+        const mimeMatch = screenshotBase64.match(/^data:(image\/\w+);base64,/);
+        const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+        const base64Data = screenshotBase64.replace(/^data:image\/\w+;base64,/, '');
+        parts.push({
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Data,
+          },
+        });
+        const firstPart = parts[0] as { text: string };
+        firstPart.text += '\n\nHere is a screenshot of the screen for additional context:';
+      }
+
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts }],
+        generationConfig: {
+          // @ts-ignore
+          thinkingConfig: { thinkingBudget: 0 },
         },
-      },
-    });
-    const response = result.response;
-    return response.text();
+      });
+      return result.response.text();
+    };
+
+    try {
+      this.logger.log(`Attempting Google Gemini with key (prefix: ${apiKey.substring(0, 8)}..., len: ${apiKey.length})`);
+      return await runGoogleApi(apiKey);
+    } catch (err: any) {
+      this.logger.warn(`Primary Gemini call failed: ${err.message}`);
+
+      // If primary key failed and envKey is different, try envKey
+      if (envKey && envKey !== apiKey) {
+        try {
+          this.logger.log(`Retrying Google Gemini with .env key (prefix: ${envKey.substring(0, 8)}...)`);
+          return await runGoogleApi(envKey);
+        } catch (retryErr: any) {
+          this.logger.warn(`Retry with .env key also failed: ${retryErr.message}`);
+        }
+      }
+
+      // If OpenRouter key is configured, fallback to OpenRouter Gemini
+      if (this.apiKeys.openrouter) {
+        this.logger.log('Falling back to OpenRouter Google Gemini 2.0 Flash...');
+        return this.callOpenRouter(systemPrompt, userPrompt, screenshotBase64, 'google/gemini-2.0-flash-exp:free');
+      }
+
+      throw err;
+    }
   }
 
   // ── OpenAI GPT-4o ──
@@ -204,13 +358,11 @@ export class AiService {
   private async callClaude(
     systemPrompt: string,
     userPrompt: string,
-    screenshotBase64?: string, // Assuming Claude service might use this later or we keep interface consistent
   ): Promise<string> {
     const anthropic = new Anthropic({
       apiKey: this.apiKeys.anthropic,
     });
 
-    // Note: Claude vision support would need implementation here if required
     const message = await anthropic.messages.create({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -227,8 +379,20 @@ export class AiService {
   getAvailableModels() {
     return [
       {
+        id: 'nemotron',
+        name: 'NVIDIA Nemotron 3.5',
+        description: 'Free + OpenRouter',
+        available: !!this.apiKeys.openrouter,
+      },
+      {
+        id: 'groq-llama',
+        name: 'Llama 3.3 70B',
+        description: 'Free + Fast',
+        available: !!this.apiKeys.groq,
+      },
+      {
         id: 'gemini-flash',
-        name: 'Gemini 2.0 Flash Lite',
+        name: 'Gemini 2.5 Flash',
         description: 'Fast + Vision',
         available: !!this.apiKeys.gemini,
       },

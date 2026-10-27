@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -8,10 +9,20 @@ export class RagService {
   private resumeContext: string = '';
   private projectContext: string = '';
   private contextDir: string;
+  private openrouterKey: string = '';
 
-  constructor() {
+  constructor(private configService: ConfigService) {
     this.contextDir = path.join(process.cwd(), 'context');
+    this.openrouterKey =
+      this.configService?.get<string>('OPENROUTER_API_KEY') ||
+      process.env.OPENROUTER_API_KEY ||
+      '';
     this.loadContextFiles();
+  }
+
+  updateOpenRouterKey(key: string): void {
+    this.openrouterKey = key;
+    this.logger.log('OpenRouter API key updated for RAG reranker');
   }
 
   /**
@@ -111,6 +122,166 @@ export class RagService {
     );
 
     this.logger.log('Created sample context files in context/ directory');
+  }
+
+  /**
+   * Split resume and project context into distinct semantic passages for reranking.
+   */
+  getContextChunks(): string[] {
+    const chunks: string[] = [];
+
+    // Parse resume if it is JSON
+    if (this.resumeContext) {
+      let parsed = false;
+      try {
+        const resumeObj = JSON.parse(this.resumeContext);
+        parsed = true;
+
+        if (resumeObj.name || resumeObj.title) {
+          chunks.push(
+            `Candidate Profile: ${resumeObj.name || ''} - ${resumeObj.title || ''}`,
+          );
+        }
+
+        if (Array.isArray(resumeObj.experience)) {
+          for (const exp of resumeObj.experience) {
+            const highlights = Array.isArray(exp.highlights)
+              ? exp.highlights.join('; ')
+              : '';
+            chunks.push(
+              `Experience at ${exp.company || 'Company'} (${exp.role || 'Role'}, ${exp.duration || ''}): ${highlights}`,
+            );
+          }
+        }
+
+        if (resumeObj.skills) {
+          if (typeof resumeObj.skills === 'object' && !Array.isArray(resumeObj.skills)) {
+            const skillsStr = Object.entries(resumeObj.skills)
+              .map(([cat, sks]) => `${cat}: ${Array.isArray(sks) ? sks.join(', ') : sks}`)
+              .join(' | ');
+            chunks.push(`Technical Skills: ${skillsStr}`);
+          } else {
+            chunks.push(`Technical Skills: ${JSON.stringify(resumeObj.skills)}`);
+          }
+        }
+
+        if (resumeObj.education) {
+          chunks.push(`Education: ${JSON.stringify(resumeObj.education)}`);
+        }
+      } catch {
+        // Not JSON
+      }
+
+      if (!parsed) {
+        const sections = this.resumeContext
+          .split(/\n\s*\n/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 20);
+        chunks.push(...sections);
+      }
+    }
+
+    // Projects context
+    if (this.projectContext) {
+      let parsedProjects = false;
+      try {
+        const projObj = JSON.parse(this.projectContext);
+        if (Array.isArray(projObj.projects)) {
+          parsedProjects = true;
+          for (const p of projObj.projects) {
+            const tech = Array.isArray(p.tech) ? p.tech.join(', ') : '';
+            const highlights = Array.isArray(p.highlights)
+              ? p.highlights.join('; ')
+              : '';
+            chunks.push(
+              `Project: ${p.name || ''} (${tech}): ${p.description || ''}. Highlights: ${highlights}`,
+            );
+          }
+        }
+      } catch {
+        // Not JSON
+      }
+
+      if (!parsedProjects) {
+        const projSections = this.projectContext
+          .split(/(?=---\s*.+?\s*---)/g)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 20);
+        chunks.push(...projSections);
+      }
+    }
+
+    return chunks.length > 0 ? chunks : [this.getContext()];
+  }
+
+  /**
+   * Use OpenRouter's nvidia/nemotron-3.5-rerank-8b:free model to rerank context chunks
+   * against the query to provide laser-focused context to the generation LLM.
+   */
+  async getRelevantContext(query: string, screenshotBase64?: string): Promise<string> {
+    const rawChunks = this.getContextChunks();
+
+    if (!this.openrouterKey || rawChunks.length <= 1) {
+      return this.getContext();
+    }
+
+    try {
+      this.logger.log(
+        `[Nemotron Rerank] Reranking ${rawChunks.length} documents for query: "${query.substring(0, 50)}..."`,
+      );
+
+      const documents: Array<{ text: string }> = rawChunks.map((chunk) => ({
+        text: chunk,
+      }));
+
+      const payload = {
+        model: 'nvidia/nemotron-3.5-rerank-8b:free',
+        query,
+        documents,
+        top_n: Math.min(documents.length, 3),
+      };
+
+      const response = await fetch('https://openrouter.ai/api/v1/rerank', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.openrouterKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/RAMJI735/Interview_ai',
+          'X-OpenRouter-Title': 'Interview AI',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        this.logger.warn(`[Nemotron Rerank] API responded with status ${response.status}: ${errText}`);
+        return this.getContext();
+      }
+
+      const data = await response.json();
+      if (data?.results && Array.isArray(data.results) && data.results.length > 0) {
+        this.logger.log(
+          `[Nemotron Rerank] Selected top ${data.results.length} relevant sections (Best score: ${data.results[0]?.relevance_score})`,
+        );
+
+        const rerankedChunks = data.results.map(
+          (result: { index: number; relevance_score: number }) => {
+            const chunk = rawChunks[result.index];
+            return `[Relevance: ${(result.relevance_score * 100).toFixed(1)}%] ${chunk}`;
+          },
+        );
+
+        return (
+          `--- RELEVANT CANDIDATE CONTEXT (Reranked by NVIDIA Nemotron 3.5) ---\n` +
+          rerankedChunks.join('\n\n')
+        );
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : 'Unknown error';
+      this.logger.warn(`[Nemotron Rerank] Execution failed: ${errMsg}. Falling back to default context.`);
+    }
+
+    return this.getContext();
   }
 
   /**
