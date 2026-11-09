@@ -4,6 +4,7 @@ import { GoogleGenerativeAI, Part } from '@google/generative-ai';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { TextBlock } from '@anthropic-ai/sdk/resources/messages';
+import { runLlamaReasoning } from './llama-reasoning';
 
 export interface AiRequest {
   transcript: string;
@@ -74,8 +75,14 @@ export class AiService {
             request.screenshotBase64,
           );
           break;
+        case 'llama-reasoning':
         case 'groq-llama':
-          text = await this.callGroq(systemPrompt, userPrompt);
+        case 'llama':
+          text = await this.callLlamaReasoning(
+            systemPrompt,
+            userPrompt,
+            request.screenshotBase64,
+          );
           break;
         default:
           if (this.apiKeys.openrouter) {
@@ -106,32 +113,60 @@ export class AiService {
     };
   }
 
+  // private buildSystemPrompt(resumeContext?: string): string {
+  //   let prompt =
+  //     'You are an expert AI interview assistant helping a Full Stack MERN developer during a live job interview.\n' +
+  //     'Your responses should be:\n' +
+  //     '- Concise but comprehensive\n' +
+  //     '- Well-structured with bullet points and code examples when relevant\n' +
+  //     '- Natural-sounding (as if the candidate is speaking)\n' +
+  //     '- Technically accurate and up-to-date\n' +
+  //     '- Formatted in Markdown for readability\n\n' +
+  //     'IMPORTANT: Keep answers brief enough to read quickly during an interview (aim for 30-60 seconds of reading time).\n' +
+  //     'If the question is about coding, provide clean, working code with brief explanations.';
+
+  //   if (resumeContext) {
+  //     prompt +=
+  //       `\n\nHere is the candidate's resume/background for personalization:\n` +
+  //       resumeContext;
+  //   }
+
+  //   return prompt;
+  // }
+
   private buildSystemPrompt(resumeContext?: string): string {
     let prompt =
-      'You are an expert AI interview assistant helping a Full Stack MERN developer during a live job interview.\n' +
-      'Your responses should be:\n' +
-      '- Concise but comprehensive\n' +
-      '- Well-structured with bullet points and code examples when relevant\n' +
-      '- Natural-sounding (as if the candidate is speaking)\n' +
-      '- Technically accurate and up-to-date\n' +
-      '- Formatted in Markdown for readability\n\n' +
-      'IMPORTANT: Keep answers brief enough to read quickly during an interview (aim for 30-60 seconds of reading time).\n' +
-      'If the question is about coding, provide clean, working code with brief explanations.';
+      'You are an expert MCA university exam assistant.\n' +
+      'CORE RULES:\n' +
+      '1. DIRECT ANSWERS ONLY: Directly solve and write the exam answer for every question shown/asked. Never summarize, describe the image, or repeat questions without answers.\n' +
+      '2. EXAM STRUCTURE: Definition -> Key Points / Headings -> Working Code / Example / Diagram -> Brief Conclusion.\n' +
+      '3. CONCISE & HIGH-SCORING: No conversational filler or chit-chat. Provide technically accurate, exam-ready answers that can be written directly on an MCA answer sheet.\n' +
+      '4. MULTI-QUESTION: If multiple questions appear, answer each in order under its question label (e.g. Q1, Q2(a)).';
 
     if (resumeContext) {
-      prompt +=
-        `\n\nHere is the candidate's resume/background for personalization:\n` +
-        resumeContext;
+      prompt += `\n\nContext:\n${resumeContext}`;
     }
 
     return prompt;
   }
 
   private buildUserPrompt(transcript: string): string {
+    const text = transcript?.trim();
+    const isGenericScreenQuery =
+      !text ||
+      text.toLowerCase().includes('what is shown on this screen') ||
+      text.toLowerCase().includes('describe the code');
+
+    if (isGenericScreenQuery) {
+      return (
+        'Solve and provide complete, exam-ready MCA answers for all questions shown in this image/question paper.\n' +
+        'Do not describe the screen or merely list the questions. Directly write out the full answers.'
+      );
+    }
+
     return (
-      `The interviewer just asked: "${transcript}"\n\n` +
-      `Provide a clear, concise answer that the candidate can use. ` +
-      `If it's a coding question, include the solution code.`
+      `Question: "${text}"\n\n` +
+      'Provide a direct, complete, exam-ready MCA answer. Include key points, definitions, and code/formulas where relevant.'
     );
   }
 
@@ -215,7 +250,42 @@ export class AiService {
     throw lastErr || new Error('All OpenRouter model candidates failed');
   }
 
-  // ── Groq (Llama 3.3 70B Fast) ──
+  // ── Llama Reasoning (OpenRouter Free Reasoning with Verification & Groq/Gemini Fallbacks) ──
+  private async callLlamaReasoning(
+    systemPrompt: string,
+    userPrompt: string,
+    screenshotBase64?: string,
+  ): Promise<string> {
+    if (this.apiKeys.openrouter) {
+      try {
+        return await runLlamaReasoning(
+          {
+            apiKey: this.apiKeys.openrouter,
+            systemPrompt,
+            userPrompt,
+            screenshotBase64,
+          },
+          this.logger,
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Llama Reasoning via OpenRouter failed: ${err?.message || err}. Falling back to Groq/Gemini...`,
+        );
+      }
+    }
+
+    if (this.apiKeys.groq) {
+      try {
+        return await this.callGroq(systemPrompt, userPrompt);
+      } catch (groqErr: any) {
+        this.logger.warn(`Groq fallback failed: ${groqErr?.message || groqErr}`);
+      }
+    }
+
+    return this.callGemini(systemPrompt, userPrompt, screenshotBase64);
+  }
+
+  // ── Groq (Llama Fast with Model Fallbacks) ──
   private async callGroq(
     systemPrompt: string,
     userPrompt: string,
@@ -231,17 +301,44 @@ export class AiService {
       baseURL: 'https://api.groq.com/openai/v1',
     });
 
-    const completion = await groqClient.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      max_tokens: 1024,
-      temperature: 0.7,
-    });
+    const candidateModels = [
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'llama3-70b-8192',
+      'llama3-8b-8192',
+    ];
 
-    return completion.choices[0]?.message?.content || 'No response generated.';
+    let lastError: any = null;
+    for (const model of candidateModels) {
+      try {
+        this.logger.log(`Attempting Groq completion with model: ${model}`);
+        const completion = await groqClient.chat.completions.create({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          max_tokens: 1024,
+          temperature: 0.7,
+        });
+
+        const content = completion.choices[0]?.message?.content;
+        if (content) {
+          return content;
+        }
+      } catch (err: any) {
+        this.logger.warn(`Groq model ${model} failed: ${err.message}`);
+        lastError = err;
+      }
+    }
+
+    // If OpenRouter is available, fallback to OpenRouter
+    if (this.apiKeys.openrouter) {
+      this.logger.log('All Groq models failed, falling back to OpenRouter...');
+      return this.callOpenRouter(systemPrompt, userPrompt);
+    }
+
+    throw lastError || new Error('All Groq models failed');
   }
 
   // ── Gemini (with Vision support & OpenRouter fallback) ──
@@ -385,10 +482,10 @@ export class AiService {
         available: !!this.apiKeys.openrouter,
       },
       {
-        id: 'groq-llama',
-        name: 'Llama 3.3 70B',
-        description: 'Free + Fast',
-        available: !!this.apiKeys.groq,
+        id: 'llama-reasoning',
+        name: 'Llama Reasoning',
+        description: 'Free + Reasoning',
+        available: !!this.apiKeys.openrouter || !!this.apiKeys.groq,
       },
       {
         id: 'gemini-flash',

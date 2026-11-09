@@ -197,7 +197,7 @@ export class InterviewGateway
       const response = await this.aiService.generateResponse({
         transcript:
           data.question ||
-          'What is shown on this screen? Describe the code or content.',
+          'Solve and provide complete exam-ready MCA answers for all questions shown.',
         screenshotBase64: data.image,
         resumeContext: await this.ragService.getRelevantContext(data.question || 'Analyze screen code and context', data.image),
         model,
