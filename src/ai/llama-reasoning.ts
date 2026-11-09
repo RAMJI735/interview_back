@@ -1,7 +1,15 @@
 import OpenAI from 'openai';
 import { Logger } from '@nestjs/common';
 
-export const REASONING_MODELS = [
+export const VISION_REASONING_MODELS = [
+  'meta-llama/llama-3.2-11b-vision-instruct:free',
+  'google/gemini-2.0-flash-exp:free',
+  'google/gemini-2.0-flash-thinking-exp:free',
+  'nvidia/nemotron-3.5-super-vl:free',
+  'meta-llama/llama-3.2-90b-vision-instruct:free',
+];
+
+export const TEXT_REASONING_MODELS = [
   'cohere/north-mini-code:free',
   'nvidia/nemotron-3.5-lightning:free',
   'recursive/flint-v1.0:free',
@@ -26,7 +34,7 @@ export async function runLlamaReasoning(
     systemPrompt,
     userPrompt,
     screenshotBase64,
-    enableSecondTurnVerification = true,
+    enableSecondTurnVerification = false,
   } = options;
 
   if (!apiKey) {
@@ -51,68 +59,50 @@ export async function runLlamaReasoning(
     ? [
         {
           type: 'text',
-          text: userPrompt + '\n\nHere is a screenshot of the screen for context:',
+          text: userPrompt,
         },
         {
           type: 'image_url',
-          image_url: { url: screenshotBase64, detail: 'low' },
+          image_url: { url: screenshotBase64 },
         },
       ]
     : userPrompt;
 
   baseMessages.push({ role: 'user', content: userContent });
 
+  // Use vision models when screenshot is present, otherwise use text reasoning models
+  const candidateModels = screenshotBase64
+    ? VISION_REASONING_MODELS
+    : TEXT_REASONING_MODELS;
+
   let selectedModel: string | null = null;
   let response1: any = null;
   let lastError: any = null;
 
-  for (const model of REASONING_MODELS) {
+  for (const model of candidateModels) {
     try {
-      logger?.log(`[Llama Reasoning] Trying free model: ${model}`);
+      logger?.log(`[Llama Reasoning] Trying free model: ${model} (hasScreenshot: ${!!screenshotBase64})`);
 
       response1 = await openai.chat.completions.create({
         model,
         messages: baseMessages,
-        max_tokens: 1500,
-        ...({ reasoning: { enabled: true } } as any),
+        max_tokens: 2000,
+        ...(!screenshotBase64 ? ({ reasoning: { enabled: true } } as any) : {}),
       });
 
-      selectedModel = model;
-      logger?.log(`[Llama Reasoning] Connected successfully: ${model}`);
-      break;
+      const content = response1.choices[0]?.message?.content;
+      if (content && content.trim().length > 0) {
+        selectedModel = model;
+        logger?.log(`[Llama Reasoning] Connected successfully: ${model}`);
+        break;
+      }
     } catch (error: any) {
       logger?.warn(
         `[Llama Reasoning] Model failed: ${model} - ${error.status || error.message}`,
       );
       lastError = error;
 
-      // If vision input failed (e.g. 400 Bad Request: image not supported), retry text-only
-      if (
-        screenshotBase64 &&
-        (error.status === 400 || error.message?.toLowerCase().includes('image'))
-      ) {
-        try {
-          const textOnlyMessages = [
-            ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-            { role: 'user', content: userPrompt },
-          ];
-          response1 = await openai.chat.completions.create({
-            model,
-            messages: textOnlyMessages,
-            max_tokens: 1500,
-            ...({ reasoning: { enabled: true } } as any),
-          });
-          selectedModel = model;
-          logger?.log(
-            `[Llama Reasoning] Connected successfully (text fallback): ${model}`,
-          );
-          break;
-        } catch (textErr: any) {
-          lastError = textErr;
-        }
-      }
-
-      // Try next model for availability/rate/server errors
+      // Try next model for availability/rate/server/bad-request errors
       if (
         error.status &&
         ![400, 404, 429, 500, 502, 503, 504].includes(error.status)
@@ -132,11 +122,12 @@ export async function runLlamaReasoning(
   const assistantMessage = response1.choices[0]?.message;
   const turn1Content = assistantMessage?.content || '';
 
-  if (!enableSecondTurnVerification) {
+  // For screenshot analysis, Turn 1 is already complete; avoid double latency and token limits
+  if (!enableSecondTurnVerification || screenshotBase64) {
     return turn1Content;
   }
 
-  // Turn 2: Reasoning verification turn as shown in llama-reasoning.js
+  // Turn 2 verification for text questions if enabled
   try {
     const turn2Messages: any[] = [
       ...baseMessages,
@@ -159,7 +150,7 @@ export async function runLlamaReasoning(
     const response2 = await openai.chat.completions.create({
       model: selectedModel,
       messages: turn2Messages,
-      max_tokens: 1500,
+      max_tokens: 2000,
       ...({ reasoning: { enabled: true } } as any),
     });
 
@@ -175,4 +166,3 @@ export async function runLlamaReasoning(
 
   return turn1Content;
 }
-

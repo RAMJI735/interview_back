@@ -46,7 +46,10 @@ export class AiService {
     let text: string;
 
     const systemPrompt = this.buildSystemPrompt(request.resumeContext);
-    const userPrompt = this.buildUserPrompt(request.transcript);
+    const userPrompt = this.buildUserPrompt(
+      request.transcript,
+      !!request.screenshotBase64,
+    );
 
     try {
       switch (request.model) {
@@ -150,24 +153,52 @@ export class AiService {
     return prompt;
   }
 
-  private buildUserPrompt(transcript: string): string {
+  private buildUserPrompt(
+    transcript: string,
+    hasScreenshot: boolean = false,
+  ): string {
     const text = transcript?.trim();
-    const isGenericScreenQuery =
-      !text ||
-      text.toLowerCase().includes('what is shown on this screen') ||
-      text.toLowerCase().includes('describe the code');
 
-    if (isGenericScreenQuery) {
-      return (
-        'Solve and provide complete, exam-ready MCA answers for all questions shown in this image/question paper.\n' +
-        'Do not describe the screen or merely list the questions. Directly write out the full answers.'
-      );
+    // Screenshot is available: prioritize solving visible content
+    if (hasScreenshot) {
+      return `
+IMPORTANT: An image/screenshot is attached.
+
+Your task is to READ and SOLVE the actual questions visible in the screenshot.
+
+STRICT INSTRUCTIONS:
+1. Never describe the image or screen.
+2. Never explain what objects or content are visible.
+3. Extract all readable questions from the screenshot.
+4. Write complete answers to every visible question.
+5. Answer questions in their original order.
+6. Use proper headings, definitions, examples and explanations.
+7. For numerical questions, show step-by-step calculations.
+8. For accounting questions, include formats and examples.
+9. Write in simple, exam-ready English.
+10. Do not skip any question.
+
+The transcript below may contain an automatically generated description of the screenshot. Treat it ONLY as supporting context, NOT as the actual question.
+
+Supporting context:
+${text || 'No transcript available.'}
+
+NOW SOLVE ALL QUESTIONS DIRECTLY.
+`;
     }
 
-    return (
-      `Question: "${text}"\n\n` +
-      'Provide a direct, complete, exam-ready MCA answer. Include key points, definitions, and code/formulas where relevant.'
-    );
+    // No screenshot: answer the actual spoken/typed question
+    return `
+Answer the following question directly.
+
+Do not describe the screen.
+Provide a complete, accurate and exam-ready answer.
+
+Question:
+${text}
+
+Use headings, examples and explanations wherever needed.
+`;
   }
 
   // ── OpenRouter (NVIDIA Nemotron with Vision & Fallbacks) ──
@@ -232,7 +263,7 @@ export class AiService {
         const completion = await openai.chat.completions.create({
           model,
           messages,
-          max_tokens: 1024,
+          max_tokens: 4096,
           temperature: 0.7,
         });
 
@@ -274,7 +305,8 @@ export class AiService {
       }
     }
 
-    if (this.apiKeys.groq) {
+    // For screenshots, Groq is text-only, so always use Gemini Vision
+    if (!screenshotBase64 && this.apiKeys.groq) {
       try {
         return await this.callGroq(systemPrompt, userPrompt);
       } catch (groqErr: any) {
